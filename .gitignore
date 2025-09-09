@@ -1,0 +1,31 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+
+# Test artifacts
+*.jpg
+*.jpeg
+test_output/
+
+# Runtime files
+*.pid
