@@ -1,3 +1,4 @@
+use arc_swap::ArcSwapOption;
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use futures_util::stream::{self, StreamExt};
@@ -10,9 +11,8 @@ use hyper_util::rt::TokioIo;
 use memchr::memmem;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use arc_swap::ArcSwapOption;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::TcpListener;
@@ -87,15 +87,15 @@ struct Config {
     /// Log level (trace, debug, info, warn, error)
     #[arg(short = 'l', long, default_value = "info")]
     log_level: String,
-    
+
     /// Global maximum memory usage in MB (0 = unlimited)
     #[arg(long, default_value_t = 100)]
     max_total_memory_mb: usize,
-    
+
     /// Memory overhead estimation in MB (for runtime allocations, HTTP processing, etc.)
     #[arg(long, default_value_t = 50)]
     memory_overhead_mb: usize,
-    
+
     /// Timeout in seconds for slow client connections
     #[arg(long, default_value_t = 5)]
     client_timeout_secs: u64,
@@ -124,14 +124,17 @@ struct ClientStats {
     frames_served: AtomicU64,
     bytes_sent: AtomicU64,
     last_update: AtomicU64, // Milliseconds since start for consistency
+    last_flush: AtomicU64,   // Track when we last flushed to global
 }
 
 impl ClientStats {
     fn new() -> Self {
+        let now = Self::current_millis();
         Self {
             frames_served: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
-            last_update: AtomicU64::new(Self::current_millis()),
+            last_update: AtomicU64::new(now),
+            last_flush: AtomicU64::new(now),
         }
     }
 
@@ -145,15 +148,16 @@ impl ClientStats {
     fn add_frame(&self, bytes: usize) {
         self.frames_served.fetch_add(1, Ordering::Relaxed);
         self.bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
-        self.last_update.store(Self::current_millis(), Ordering::Relaxed);
+        self.last_update
+            .store(Self::current_millis(), Ordering::Relaxed);
     }
 
     fn should_flush_to_global(&self, global_stats: &ServerStats) -> bool {
-        let last = self.last_update.load(Ordering::Relaxed);
+        let last_flush = self.last_flush.load(Ordering::Relaxed);
         let now = Self::current_millis();
-        
+
         // More aggressive flushing: 500ms for regular flush
-        if now.saturating_sub(last) > 500 { 
+        if now.saturating_sub(last_flush) > 500 {
             self.flush_to_global(global_stats);
             true
         } else {
@@ -164,7 +168,7 @@ impl ClientStats {
     fn force_flush_if_stale(&self, global_stats: &ServerStats, max_age_ms: u64) -> bool {
         let last = self.last_update.load(Ordering::Relaxed);
         let now = Self::current_millis();
-        
+
         if now.saturating_sub(last) > max_age_ms {
             self.flush_to_global(global_stats);
             true
@@ -183,9 +187,10 @@ impl ClientStats {
                 .fetch_add(frames, Ordering::Relaxed);
             global_stats.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
         }
-        
-        // Reset last_update to prevent repeated flushes
-        self.last_update.store(Self::current_millis(), Ordering::Relaxed);
+
+        // Update last_flush to track when we flushed
+        self.last_flush
+            .store(Self::current_millis(), Ordering::Relaxed);
     }
 }
 
@@ -204,10 +209,10 @@ impl ServerStats {
 fn validate_config(config: &Config) -> Result<(), String> {
     // Validate log level
     match config.log_level.as_str() {
-        "trace" | "debug" | "info" | "warn" | "error" => {},
+        "trace" | "debug" | "info" | "warn" | "error" => {}
         _ => return Err(format!("Invalid log level: {}", config.log_level)),
     }
-    
+
     // Validate memory limits
     if config.max_partial_frame_mb == 0 {
         return Err("max_partial_frame_mb must be greater than 0".to_string());
@@ -216,7 +221,8 @@ fn validate_config(config: &Config) -> Result<(), String> {
         return Err("max_camera_buffer_mb must be greater than 0".to_string());
     }
     if config.max_total_memory_mb > 0 {
-        let total_required = config.max_partial_frame_mb + config.max_camera_buffer_mb + config.memory_overhead_mb;
+        let total_required =
+            config.max_partial_frame_mb + config.max_camera_buffer_mb + config.memory_overhead_mb;
         if total_required > config.max_total_memory_mb {
             return Err(format!(
                 "Total memory requirement ({} MB) exceeds max_total_memory_mb ({} MB)",
@@ -224,7 +230,7 @@ fn validate_config(config: &Config) -> Result<(), String> {
             ));
         }
     }
-    
+
     // Validate buffer sizes
     if config.buffer_size == 0 {
         return Err("buffer_size must be greater than 0".to_string());
@@ -232,13 +238,13 @@ fn validate_config(config: &Config) -> Result<(), String> {
     if config.max_clients == 0 {
         return Err("max_clients must be greater than 0".to_string());
     }
-    
+
     // Validate camera args
     if let Err(e) = shell_words::split(&config.camera_args) {
         warn!("Camera arguments may be malformed: {}", e);
         warn!("Using raw arguments string: {}", config.camera_args);
     }
-    
+
     Ok(())
 }
 
@@ -265,10 +271,10 @@ fn find_jpeg_frames(
 
     let soi_finder = memmem::Finder::new(&JPEG_SOI);
     let eoi_finder = memmem::Finder::new(&JPEG_EOI);
-    
+
     loop {
         let data = &buffer[..];
-        
+
         // Fast search for next JPEG start
         if let Some(soi_pos) = soi_finder.find(data) {
             // Fast search for corresponding end marker
@@ -276,11 +282,11 @@ fn find_jpeg_frames(
             if search_start >= data.len() {
                 break;
             }
-            
+
             if let Some(eoi_pos) = eoi_finder.find(&data[search_start..]) {
                 let absolute_eoi = search_start + eoi_pos;
                 let frame_end = absolute_eoi + 2;
-                
+
                 if frame_end <= data.len() {
                     // Complete frame found - extract with true zero-copy using split_to
                     if soi_pos > 0 {
@@ -288,24 +294,26 @@ fn find_jpeg_frames(
                     }
                     let frame_bytes = buffer.split_to(frame_end - soi_pos);
                     frames.push(frame_bytes.freeze());
-                    
+
                     // Removed debug logging from hot path - use trace if needed
                     // trace!("Found complete JPEG frame: {} bytes", frame_end - soi_pos);
                     continue; // Look for more frames in remaining buffer
                 }
             }
-            
+
             // No complete frame found - save partial if within limits
             let partial_data = &data[soi_pos..];
             // Check both individual frame size and total accumulated partial size
-            if partial_data.len() < max_partial_size && 
-               (partial.len() + partial_data.len()) < max_partial_size {
+            if partial_data.len() < max_partial_size
+                && (partial.len() + partial_data.len()) < max_partial_size
+            {
                 partial.extend_from_slice(partial_data);
                 // Removed debug logging from hot path - use trace if needed
                 // trace!("Saved partial frame: {} bytes", partial_data.len());
             } else {
                 // Rate-limit warning to prevent log spam
-                static PARTIAL_WARN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static PARTIAL_WARN_COUNT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
                 let count = PARTIAL_WARN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if count == 0 || count % 100 == 0 {
                     warn!(
@@ -343,10 +351,10 @@ fn calculate_backoff(attempt: u32) -> Duration {
     // Use bit shift for power of 2, cap at 6 to avoid unnecessary computation
     let capped_attempt = attempt.min(6); // 2^6 = 64, which will be clamped to 60 anyway
     let base_delay = (1u64 << capped_attempt).min(MAX_RETRY_DELAY);
-    
+
     // Add jitter to prevent thundering herd: 80-120% of base delay
     let jitter_factor = 0.8 + 0.4 * rand::random::<f64>();
-    
+
     let jittered_delay = ((base_delay as f64 * jitter_factor).round() as u64).max(1);
     Duration::from_secs(jittered_delay)
 }
@@ -390,31 +398,29 @@ async fn spawn_and_read_camera(
                     config.camera_cmd,
                     retry_attempt + 1
                 );
-                
+
                 // Record when camera started successfully for sliding reset window
                 camera_start_time = Some(Instant::now());
-                
+
                 child
             }
             Err(e) => {
                 if retry_attempt >= MAX_RETRY_ATTEMPTS {
                     error!(
                         "Failed to start {} after {} attempts: {}. Giving up.",
-                        config.camera_cmd,
-                        MAX_RETRY_ATTEMPTS,
-                        e
+                        config.camera_cmd, MAX_RETRY_ATTEMPTS, e
                     );
                     break;
                 }
                 let delay = calculate_backoff(retry_attempt);
-                
+
                 // Log suppression: log every attempt for first 3, then exponentially less frequently
-                let should_log = retry_attempt < 3 || 
-                    retry_attempt == 5 || 
-                    retry_attempt == 10 || 
-                    retry_attempt == 15 ||
-                    retry_attempt == MAX_RETRY_ATTEMPTS - 1;
-                
+                let should_log = retry_attempt < 3
+                    || retry_attempt == 5
+                    || retry_attempt == 10
+                    || retry_attempt == 15
+                    || retry_attempt == MAX_RETRY_ATTEMPTS - 1;
+
                 if should_log {
                     error!(
                         "Failed to start {}: {}. Retrying in {} seconds (attempt #{}/{})...",
@@ -434,7 +440,7 @@ async fn spawn_and_read_camera(
                         delay.as_secs()
                     );
                 }
-                
+
                 tokio::time::sleep(delay).await;
                 retry_attempt = retry_attempt.saturating_add(1);
                 continue;
@@ -449,7 +455,7 @@ async fn spawn_and_read_camera(
                 continue;
             }
         };
-        
+
         // Spawn task to capture and log stderr for debugging
         if let Some(stderr) = child.stderr.take() {
             let camera_cmd = config.camera_cmd.clone();
@@ -474,7 +480,7 @@ async fn spawn_and_read_camera(
                 }
             });
         }
-        
+
         // Wrap stdout with BufReader to reduce syscalls
         let mut stdout = BufReader::with_capacity(64 * 1024, stdout);
 
@@ -523,7 +529,7 @@ async fn spawn_and_read_camera(
                                 // Sliding reset window: reset retry counter after sustained success
                                 if let Some(start_time) = camera_start_time {
                                     if retry_attempt > 0 && start_time.elapsed().as_secs() >= reset_window_secs {
-                                        debug!("Camera has run successfully for {}s, resetting retry counter from {} to 0", 
+                                        debug!("Camera has run successfully for {}s, resetting retry counter from {} to 0",
                                                reset_window_secs, retry_attempt);
                                         retry_attempt = 0;
                                         camera_start_time = None; // Prevent repeated resets
@@ -565,20 +571,19 @@ async fn spawn_and_read_camera(
             if retry_attempt >= MAX_RETRY_ATTEMPTS {
                 error!(
                     "Camera process {} failed too many times ({}). Giving up.",
-                    config.camera_cmd,
-                    MAX_RETRY_ATTEMPTS
+                    config.camera_cmd, MAX_RETRY_ATTEMPTS
                 );
                 break;
             }
             let delay = calculate_backoff(retry_attempt);
-            
+
             // Apply same log suppression pattern for restarts
-            let should_log = retry_attempt < 3 || 
-                retry_attempt == 5 || 
-                retry_attempt == 10 || 
-                retry_attempt == 15 ||
-                retry_attempt == MAX_RETRY_ATTEMPTS - 1;
-            
+            let should_log = retry_attempt < 3
+                || retry_attempt == 5
+                || retry_attempt == 10
+                || retry_attempt == 15
+                || retry_attempt == MAX_RETRY_ATTEMPTS - 1;
+
             if should_log {
                 info!(
                     "Restarting {} in {} seconds (attempt #{}/{})...",
@@ -605,7 +610,7 @@ async fn spawn_and_read_camera(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(Config::parse());
-    
+
     // Validate configuration
     if let Err(e) = validate_config(&config) {
         eprintln!("Configuration error: {}", e);
@@ -629,9 +634,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::EnvFilter::new(format!("{}={},hyper=warn", module_name, log_level))
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let stats = Arc::new(ServerStats::new());
     let latest_frame = Arc::new(ArcSwapOption::from(None));
@@ -677,7 +680,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-
     // Setup server
     let addr: SocketAddr = format!("{}:{}", config.address, config.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
@@ -696,15 +698,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup shutdown handler for multiple signals
     let shutdown_signal = async {
         let ctrl_c = async {
-            signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
+            signal::ctrl_c()
+                .await
+                .expect("Failed to install Ctrl+C handler");
         };
 
         #[cfg(unix)]
         let terminate = async {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
-            let mut sighup = signal(SignalKind::hangup()).expect("Failed to install SIGHUP handler");
-            
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+            let mut sighup =
+                signal(SignalKind::hangup()).expect("Failed to install SIGHUP handler");
+
             tokio::select! {
                 _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
                 _ = sighup.recv() => info!("Received SIGHUP, shutting down..."),
@@ -722,7 +728,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Already logged in terminate branch
             }
         }
-        
+
         if let Err(e) = shutdown_tx.send(true) {
             error!("Failed to send shutdown signal: {}", e);
         }
@@ -894,12 +900,7 @@ async fn serve_stats(
 
     let json = format!(
         r#"{{"version":"{}","active_connections":{},"total_connections":{},"rejected_connections":{},"frames_served":{},"bytes_sent":{}}}"#,
-        VERSION,
-        active,
-        total,
-        rejected,
-        frames,
-        bytes
+        VERSION, active, total, rejected, frames, bytes
     );
 
     let body = BodyExt::boxed(StreamBody::new(stream::once(async {
@@ -982,7 +983,14 @@ async fn serve_mjpeg_stream(
     let header_buf = BytesMut::with_capacity(256);
 
     let stream = stream::unfold(
-        (rx, stats.clone(), header_buf, client_stats.clone(), boundary.clone(), shutdown_rx.clone()),
+        (
+            rx,
+            stats.clone(),
+            header_buf,
+            client_stats.clone(),
+            boundary.clone(),
+            shutdown_rx.clone(),
+        ),
         move |(mut rx, stats, mut buf, client_stats, boundary, shutdown_rx)| async move {
             loop {
                 // Check for shutdown before recv
@@ -1015,7 +1023,10 @@ async fn serve_mjpeg_stream(
                         client_stats.add_frame(data.len());
                         client_stats.should_flush_to_global(&stats); // Auto-flush if needed
 
-                        return Some((data.freeze(), (rx, stats, buf, client_stats, boundary, shutdown_rx)));
+                        return Some((
+                            data.freeze(),
+                            (rx, stats, buf, client_stats, boundary, shutdown_rx),
+                        ));
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // Use trace for hot-path lag messages to reduce log noise
@@ -1039,16 +1050,21 @@ async fn serve_mjpeg_stream(
 
     // Pin the stream to satisfy the Unpin requirement
     let pinned_stream = Box::pin(stream);
-    
+
     // Wrap stream with timeout and proper cleanup
     let timeout_stream = stream::unfold(
         (pinned_stream, stats.clone(), client_stats.clone()),
         move |(mut stream, stats, client_stats)| async move {
-            match tokio::time::timeout(Duration::from_secs(client_timeout_secs), stream.next()).await {
+            match tokio::time::timeout(Duration::from_secs(client_timeout_secs), stream.next())
+                .await
+            {
                 Ok(Some(bytes)) => {
                     // Periodic flush check for slow clients (every 10 seconds of stale stats)
                     client_stats.force_flush_if_stale(&stats, 10_000);
-                    Some((Ok::<_, Infallible>(Frame::data(bytes)), (stream, stats, client_stats)))
+                    Some((
+                        Ok::<_, Infallible>(Frame::data(bytes)),
+                        (stream, stats, client_stats),
+                    ))
                 }
                 Ok(None) => {
                     // Stream ended normally, stats already flushed
@@ -1061,7 +1077,7 @@ async fn serve_mjpeg_stream(
                     None // Properly terminate the stream
                 }
             }
-        }
+        },
     );
     let body = BodyExt::boxed(StreamBody::new(timeout_stream));
 
